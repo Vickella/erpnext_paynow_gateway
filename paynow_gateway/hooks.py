@@ -252,6 +252,7 @@ doctype_js = {
     "Sales Invoice": "public/js/sales_invoice_custom.js"
 }
 after_install = "paynow_gateway.paynow_gateway.setup.after_install"
+after_migrate = "paynow_gateway.paynow_gateway.setup.after_migrate"
 
 fixtures = [
     {

@@ -70,16 +70,16 @@ Payment Gateway App
 
 # ⚙️ Payment Flow
 
-## 💵 USD (Paynow)
+## Visa/Mastercard hosted checkout
 
 ```text
-Invoice → Button Click → Dialog → Backend API → Paynow → Webhook → Payment Entry → Invoice Paid
+Invoice → Customer selects Visa → Paynow hosted checkout → Signed callback → Payment Entry
 ```
 
-## 🇿🇼 ZWG (EcoCash)
+## Mobile money
 
 ```text
-Invoice → Button Click → Dialog → Backend API → EcoCash → Callback → Payment Entry → Invoice Paid
+Invoice → Customer selects mobile money → EcoCash prompt → Signed callback → Payment Entry
 ```
 
 ---
@@ -97,13 +97,7 @@ When system is in TEST mode:
 | Cancelled          | 0773333333 |
 | Insufficient Funds | 0774444444 |
 
-## Card / Token Testing
-
-* Success token
-* Pending token
-* Failed token
-
-No real money is processed in test mode.
+Use Paynow's current test-mode integration credentials and test payment methods. No real money should be processed in test mode. Saved-card tokens are not used by this one-time hosted checkout flow.
 
 ---
 
@@ -143,10 +137,8 @@ No real money is processed in test mode.
 
 # 🖥️ UI Behavior
 
-* Single payment button per invoice
-
-  * Pay with Paynow (USD)
-  * Pay with EcoCash (ZWG)
+* Customers choose Mobile Money or Visa/Mastercard for an outstanding invoice.
+* Mobile Money uses the EcoCash prompt; Visa/Mastercard uses Paynow hosted checkout.
 
 * System automatically:
 
@@ -185,6 +177,20 @@ No real money is processed in test mode.
 * Mobile app support
 
 ---
+
+## Visa/Mastercard Hosted Checkout
+
+The gateway sends first-time card payments to Paynow's hosted checkout. Card numbers are entered on Paynow and are never sent to this app. The customer returns to the shop while Paynow posts a signed result to the configured result URL.
+
+Before enabling Visa:
+
+1. Ask Paynow to activate Visa/Mastercard for the integration ID configured in Paynow Settings.
+2. Set `result_url` to `https://<your-site>/api/method/paynow_gateway.paynow_gateway.api.paynow_webhook` and set the HTTPS `return_url` to `https://<your-site>/orders2` so the shop resumes payment-status polling when the customer returns.
+3. Deploy the gateway and run `bench --site <site_name> migrate`, then restart the web workers.
+4. In Paynow Settings, enable Paynow and then enable Visa/Mastercard separately for each approved USD or ZWG integration. Both Visa switches are off by default.
+5. Test the card redirect and signed callback using Paynow test credentials before enabling the live integration.
+
+Do not set `tokenize=true` for one-time checkout. Saving cards for recurring payments requires separate Paynow approval.
 
 # 📌 Summary
 

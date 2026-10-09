@@ -1,11 +1,14 @@
-import frappe
-from paynow import Paynow
-from frappe import _
+import hashlib
+import hmac
 import uuid
-from frappe.utils import now
+from urllib.parse import parse_qs, parse_qsl, urlparse
+
+import frappe
+from frappe import _
+from frappe.utils import flt, now
+from paynow import Paynow
 from paynow_gateway.paynow_gateway.zoho_client import (
 	extract_zoho_invoice_fields,
-	get_request_data,
 	record_zoho_invoice_payment,
 )
 
@@ -30,96 +33,261 @@ def get_paynow_credentials(settings, currency):
     return integration_id, integration_key
 
 
-@frappe.whitelist()
-def process_paynow_payment(invoice, phone, amount):
-    print(f"\n{'='*70}")
-    print(f"DEBUG: PAYNOW START")
-    print(f"DEBUG: Invoice: {invoice}")
-    print(f"DEBUG: Phone: {phone}")
-    print(f"DEBUG: Amount: {amount}")
-
-    txn_id = str(uuid.uuid4())
-    inv_doc = frappe.get_doc("Sales Invoice", invoice)
-    settings = frappe.get_single("Paynow Settings")
-    print(f"DEBUG: Doc Currency: {inv_doc.currency}")
-    integration_id, integration_key = get_paynow_credentials(settings, inv_doc.currency)
-    paynow = Paynow(
-        integration_id,
-        integration_key,
-        settings.return_url,
-        settings.result_url 
-    )
-    payment = paynow.create_payment(txn_id, settings.email)
-    payment.add(f"Payment for Invoice {inv_doc.name}", amount)
+def verify_paynow_hash(fields, integration_key):
     try:
-        print("DEBUG: Sending Request to Paynow Server...")
-        raw_response = paynow.send_mobile(payment, phone, 'ecocash')
-        print("DEBUG RESPONSE:", raw_response)
-        if raw_response.success: 
-            poll_url = raw_response.poll_url
-            print(f"DEBUG: Response Success. Poll URL: {poll_url}")
-            inv_doc.db_set("custom_paynow_poll_url", poll_url)
-            frappe.log_error(f"Paynow Prompt Sent: {inv_doc.name}", "Paynow Info Success")
-            print("DEBUG: PAYNOW END SUCCESS")
-            from urllib.parse import urlparse, parse_qs
-            parsed = urlparse(poll_url)
-            params = parse_qs(parsed.query)
-            guid = params.get("guid", [None])[0]
-            payment_txn = frappe.get_doc({
-                    "doctype": "Paynow Transaction",
-                    "transaction_id":txn_id,
-                    "payment_gateway": "Paynow",
-                    "sales_invoice":inv_doc.name,
-                    "amount": amount,
-                    "status": "Initiated",
-                    "phone_number": phone,
-                    "poll_url": poll_url,
-                    "guid": guid
-                    })
+        received_hashes = [value for key, value in fields if str(key).lower() == "hash"]
+    except (TypeError, ValueError):
+        return False
+    if len(received_hashes) != 1 or not integration_key:
+        return False
 
-            payment_txn.insert(ignore_permissions=True)
-            frappe.db.commit()
+    try:
+        message = "".join(str(value) for key, value in fields if str(key).lower() != "hash")
+        expected_hash = hashlib.sha512(f"{message}{integration_key.lower()}".encode("utf-8")).hexdigest().upper()
+        return hmac.compare_digest(str(received_hashes[0]).upper(), expected_hash)
+    except (TypeError, ValueError):
+        return False
 
-            return {
-                "status": "success",
-                "message": _("Payment prompt sent to {0}").format(phone),
-                "poll_url": poll_url
-            }
-        else:
-            print("\nPAYNOW FAILED DEBUG START")
 
-            print("SUCCESS:", raw_response.success)
-            print("STATUS:", raw_response.status)
+def normalize_paynow_status(status, current_status):
+    status_map = {
+        "created": "Initiated",
+        "sent": "Pending",
+        "paid": "Paid",
+        "awaiting delivery": "Paid",
+        "delivered": "Paid",
+        "cancelled": "Cancelled",
+        "refunded": "Failed",
+        "disputed": "Failed",
+        "error": "Failed",
+    }
+    return status_map.get((status or "").strip().lower(), current_status)
 
-            print("RAW DATA:", raw_response.data)
 
-            try:
-                print("ERROR FIELD:", raw_response.data.get("error"))
-            except Exception:
-                pass
+def verify_paynow_response(response, integration_key):
+    response_data = getattr(response, "data", None)
+    if isinstance(response_data, str):
+        fields = parse_qsl(response_data, keep_blank_values=True)
+    elif isinstance(response_data, dict):
+        fields = list(response_data.items())
+    else:
+        return False
 
-            frappe.log_error(
-                title="PAYNOW REAL FAILURE",
-                message=str(raw_response.data)
-            )
+    return verify_paynow_hash(fields, integration_key)
 
-            frappe.throw(_("Paynow failed: {0}").format(raw_response.data))
 
-    except Exception as e:
-        print(f"DEBUG: Critical Exception: {str(e)}")
-        frappe.log_error(frappe.get_traceback(), "Paynow Integration Error")
-        frappe.throw(_("An error occurred while connecting to Paynow. Please check logs."))
+def get_paynow_callback_payload():
+    request = frappe.request
+    raw_body = request.get_data(as_text=True) if request else ""
+    fields = parse_qsl(raw_body, keep_blank_values=True)
+    if not fields and request:
+        fields = list(request.form.items(multi=True))
+
+    payload = {}
+    for key, value in fields:
+        payload[key.lower()] = value
+    return fields, payload
+
+
+def get_payable_invoice(invoice_name):
+    user = frappe.session.user
+    if not user or user == "Guest":
+        frappe.throw(_("Please log in before paying an invoice."), frappe.PermissionError)
+
+    invoice = frappe.get_doc("Sales Invoice", invoice_name)
+    if invoice.docstatus != 1:
+        frappe.throw(_("Only submitted invoices can be paid."))
+
+    permitted = frappe.has_permission("Sales Invoice", "read", doc=invoice)
+    user_email = str(frappe.db.get_value("User", user, "email") or user).strip().lower()
+    customer_email = frappe.db.get_value("Customer", invoice.customer, "email_id")
+    invoice_email = getattr(invoice, "contact_email", None)
+    invoice_emails = {
+        str(email).strip().lower()
+        for email in (customer_email, invoice_email)
+        if email
+    }
+    linked_customers = set(frappe.get_all("Customer", filters={"email_id": user_email}, pluck="name"))
+    contacts = frappe.get_all("Contact Email", filters={"email_id": user_email}, pluck="parent")
+    if contacts:
+        linked_customers.update(frappe.get_all(
+            "Dynamic Link",
+            filters={
+                "parenttype": "Contact",
+                "parent": ["in", contacts],
+                "link_doctype": "Customer",
+            },
+            pluck="link_name",
+        ))
+
+    if not permitted and invoice.owner != user and user_email not in invoice_emails and invoice.customer not in linked_customers:
+        frappe.throw(_("You are not allowed to pay this invoice."), frappe.PermissionError)
+
+    amount = flt(invoice.outstanding_amount)
+    if amount <= 0:
+        frappe.throw(_("This invoice has no outstanding balance."))
+
+    return invoice, amount
+
+
+def save_paynow_transaction(invoice, transaction_id, amount, response, payment_method, phone=None):
+    poll_url = response.poll_url
+    parsed = urlparse(poll_url or "")
+    guid = parse_qs(parsed.query).get("guid", [None])[0]
+    payment_txn = frappe.get_doc({
+        "doctype": "Paynow Transaction",
+        "transaction_id": transaction_id,
+        "payment_gateway": "Paynow",
+        "payment_method": payment_method,
+        "sales_invoice": invoice.name,
+        "amount": amount,
+        "currency": invoice.currency,
+        "status": "Initiated",
+        "phone_number": phone,
+        "poll_url": poll_url,
+        "guid": guid,
+    })
+    payment_txn.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return payment_txn
+
+
+def get_enabled_paynow_settings(currency):
+    settings = frappe.get_single("Paynow Settings")
+    if not settings.enabled:
+        frappe.throw(_("Paynow payments are currently disabled."))
+    integration_id, integration_key = get_paynow_credentials(settings, currency)
+    return settings, integration_id, integration_key
+
+
+def is_paynow_configured(settings, currency):
+    currency = (currency or "").strip().upper()
+    if currency == "USD":
+        integration_id, integration_key = settings.usd_integration_id, settings.usd_integration_key
+    elif currency in {"ZIG", "ZWG"}:
+        integration_id, integration_key = settings.zwg_integration_id, settings.zwg_integration_key
+    else:
+        return False
+    return bool(settings.enabled and integration_id and integration_key)
+
+
+def is_visa_checkout_enabled(settings, currency):
+    currency = (currency or "").strip().upper()
+    if currency == "USD":
+        return bool(settings.usd_visa_checkout_enabled)
+    if currency in {"ZIG", "ZWG"}:
+        return bool(settings.zwg_visa_checkout_enabled)
+    return False
+
+
+def get_paynow_customer_email():
+    user = frappe.session.user
+    return frappe.db.get_value("User", user, "email") or user
+
+
+@frappe.whitelist()
+def process_paynow_payment(invoice, phone, amount=None):
+    try:
+        invoice_doc, payable_amount = get_payable_invoice(invoice)
+        if not phone or not str(phone).strip():
+            frappe.throw(_("A mobile money number is required."))
+
+        settings, integration_id, integration_key = get_enabled_paynow_settings(invoice_doc.currency)
+        transaction_id = str(uuid.uuid4())
+        paynow = Paynow(integration_id, integration_key, settings.return_url, settings.result_url)
+        payment = paynow.create_payment(transaction_id, get_paynow_customer_email())
+        payment.add(f"Payment for Invoice {invoice_doc.name}", payable_amount)
+        response = paynow.send_mobile(payment, str(phone).strip(), "ecocash")
+
+        if not response.success or not verify_paynow_response(response, integration_key):
+            frappe.throw(_("Paynow did not return a valid mobile payment response."))
+
+        save_paynow_transaction(invoice_doc, transaction_id, payable_amount, response, "Mobile Money", str(phone).strip())
+        invoice_doc.db_set("custom_paynow_poll_url", response.poll_url)
+        return {
+            "status": "success",
+            "message": _("Payment prompt sent to {0}").format(phone),
+            "poll_url": response.poll_url,
+        }
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), "Paynow Mobile Payment Error")
+        raise
+
+
+@frappe.whitelist()
+def process_paynow_card_payment(invoice):
+    try:
+        invoice_doc, payable_amount = get_payable_invoice(invoice)
+        settings, integration_id, integration_key = get_enabled_paynow_settings(invoice_doc.currency)
+        if not is_visa_checkout_enabled(settings, invoice_doc.currency):
+            frappe.throw(_("Visa checkout is not enabled for this merchant account."))
+
+        transaction_id = str(uuid.uuid4())
+        paynow = Paynow(integration_id, integration_key, settings.return_url, settings.result_url)
+        payment = paynow.create_payment(transaction_id, get_paynow_customer_email())
+        payment.add(f"Payment for Invoice {invoice_doc.name}", payable_amount)
+        response = paynow.send(payment)
+
+        if not response.success or not verify_paynow_response(response, integration_key):
+            frappe.throw(_("Paynow did not return a valid card checkout response."))
+
+        redirect_url = response.redirect_url
+        parsed_url = urlparse(redirect_url or "")
+        hostname = (parsed_url.hostname or "").lower()
+        if parsed_url.scheme != "https" or not (hostname == "paynow.co.zw" or hostname.endswith(".paynow.co.zw")):
+            frappe.throw(_("Paynow returned an invalid checkout URL."))
+
+        save_paynow_transaction(invoice_doc, transaction_id, payable_amount, response, "Visa/Mastercard")
+        invoice_doc.db_set("custom_paynow_poll_url", response.poll_url)
+        return {
+            "status": "success",
+            "redirect_url": redirect_url,
+            "poll_url": response.poll_url,
+        }
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), "Paynow Card Checkout Error")
+        raise
+
+
+@frappe.whitelist()
+def get_checkout_options(invoice):
+    invoice_doc, amount = get_payable_invoice(invoice)
+    settings = frappe.get_single("Paynow Settings")
+    configured = is_paynow_configured(settings, invoice_doc.currency)
+
+    return {
+        "amount": amount,
+        "mobile_money": configured,
+        "visa_card": configured and is_visa_checkout_enabled(settings, invoice_doc.currency),
+    }
 
 @frappe.whitelist(allow_guest=True)
 def paynow_webhook():
+    fields, data = get_paynow_callback_payload()
+    reference = data.get("reference")
+    transaction = frappe.db.get_value(
+        "Paynow Transaction",
+        {"transaction_id": reference},
+        ["name", "currency", "sales_invoice"],
+        as_dict=True,
+    ) if reference else None
+    if not transaction:
+        frappe.log_error(str(data), "Paynow Callback Transaction Not Found")
+        frappe.throw(_("Paynow transaction was not found."))
+
+    settings = frappe.get_single("Paynow Settings")
+    transaction_currency = transaction.get("currency") if isinstance(transaction, dict) else transaction.currency
+    sales_invoice = transaction.get("sales_invoice") if isinstance(transaction, dict) else transaction.sales_invoice
+    if not transaction_currency and sales_invoice:
+        transaction_currency = frappe.db.get_value("Sales Invoice", sales_invoice, "currency")
+    integration_id, integration_key = get_paynow_credentials(settings, transaction_currency)
+    if not verify_paynow_hash(fields, integration_key):
+        frappe.log_error(str(data), "Paynow Callback Hash Validation Failed")
+        frappe.throw(_("Paynow callback signature is invalid."), frappe.PermissionError)
+
     frappe.set_user("Administrator")
-
-    print("\n🔥 WEBHOOK RECEIVED")
-
-    data = get_request_data()
-
-    print("FINAL DATA:", data)
-
     process_paynow_webhook(data)
 
     return "ok"
@@ -153,7 +321,12 @@ def process_paynow_webhook(data):
         print("Already processed, skipping")
         return
 
-    txn.status = status or txn.status
+    callback_amount = flt(data.get("amount"))
+    if callback_amount != flt(txn.amount):
+        frappe.log_error(str(data), "Paynow Callback Amount Mismatch")
+        frappe.throw(_("Paynow callback amount does not match the transaction."))
+
+    txn.status = normalize_paynow_status(status, txn.status)
     txn.paynow_reference = paynow_reference or txn.paynow_reference
     txn.poll_url = poll_url or txn.poll_url
     incoming_invoice_number, incoming_invoice_id = extract_zoho_invoice_fields(data)
@@ -180,7 +353,7 @@ def handle_paid_transaction(txn, data):
         print("⚠️ Already processed, skipping")
         return
 
-    if (data.get("status") or "").lower() != "paid":
+    if (data.get("status") or "").strip().lower() not in {"paid", "awaiting delivery"}:
         return
 
     print("\n💰 PAYMENT CONFIRMED - CREATING PAYMENT ENTRY")
@@ -220,7 +393,7 @@ def handle_paid_transaction(txn, data):
         "party": inv.customer,
         "paid_amount": txn.amount,
         "received_amount": txn.amount,
-        "mode_of_payment": "Ecocash",  # adjust if needed
+        "mode_of_payment": "Paynow Visa" if (txn.payment_method or "").lower().startswith("visa") else "Ecocash",
         "reference_no": txn.paynow_reference or txn.transaction_id,
         "reference_date": now(),
         "paid_to":paid_to_account,  # adjust your account
@@ -236,9 +409,6 @@ def handle_paid_transaction(txn, data):
     payment_entry.submit()
 
     print("✅ Payment Entry Created:", payment_entry.name)
-
-    # 🔥 update invoice
-    inv.db_set("status", "Paid")
 
     # 🔥 update transaction
     txn.status = "Completed"

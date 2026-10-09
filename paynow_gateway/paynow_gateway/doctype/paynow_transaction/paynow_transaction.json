@@ -9,6 +9,7 @@
   "amended_from",
   "transaction_id",
   "payment_gateway",
+  "payment_method",
   "guid",
   "currency",
   "amount",
@@ -125,6 +126,14 @@
    "fieldname": "payment_gateway",
    "fieldtype": "Data",
    "label": "Payment Gateway"
+  },
+  {
+   "default": "Mobile Money",
+   "fieldname": "payment_method",
+   "fieldtype": "Select",
+   "in_filter": 1,
+   "label": "Payment Method",
+   "options": "Mobile Money\nVisa/Mastercard"
   },
   {
    "fieldname": "phone_number",
